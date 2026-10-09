@@ -1,0 +1,26 @@
+[project]
+name = "videobook"
+version = "0.1.0"
+description = "Agent-guided video transcripts and illustrated books"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp>=2024.0.0",
+    "youtube-transcript-api>=0.6.0",
+    "python-dotenv>=1.0.0",
+    "webvtt-py>=0.5.0",
+    "markdown>=3.5.0",
+    "imageio-ffmpeg>=0.6.0",
+    "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Scripts run directly from src/; the distribution installs their dependencies.
+[tool.setuptools]
+py-modules = []
