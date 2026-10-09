@@ -75,7 +75,7 @@ python src/pipeline.py serve <video_id>
 
 完整流程生成 `transcript.corrected.txt`、`corrections.json`、`book.tagged.md`、`book.md`、`images/` 和 `book.html`。`run.json` 记录检查点；原始字幕和下载兜底文件供追溯与恢复。
 
-本地生成完成后，需要发布时明确告诉助手。发布要求目录具有 Git 元数据和预期远端，操作见 [发布说明](.agents/skills/videobook/references/publishing.md)。
+本地生成完成后，需要发布时明确告诉助手。公开课程笔记发布到个人主页的 [Lessons](https://foolishdominator.github.io/lessons/)，与主页共用样式；本仓库用于生成笔记。发布命令需要通过 `--site-repo` 指定主页仓库的本地路径，操作见 [发布说明](.agents/skills/videobook/references/publishing.md)。
 
 ## 开发检查
 
