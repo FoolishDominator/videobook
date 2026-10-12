@@ -125,7 +125,6 @@ def fetch_via_ytdlp(video_url: str, cookies_from: str = None, cookies_file: str 
         "--sub-langs", "en.*,zh.*,ai-zh,ai-en",
         "--skip-download",
         "--sub-format", "vtt/best",
-        "--no-check-certificates",
         "--ignore-errors",
         "-o", os.path.join(tmp_dir, "%(id)s.%(ext)s"),
         video_url

@@ -1,13 +1,14 @@
-"""准备课程笔记发布；--site-repo 写入个人主页的 lessons/。
+"""准备课程笔记发布；仓库目录和公开网站根地址必须显式指定。
 
 发布笔记、引用的图片、前端资源及订正字幕；不发布原始字幕、srt、
 tagged 稿等中间物。全程使用 git plumbing + 临时 index/工作树，不切换分支、
-不触碰 main 工作区与 output/ 目录。脚本只写本地 ref，推送由执行者显式完成。
+不触碰站点工作区与 output/ 目录。脚本只写本地 ref，推送由执行者显式完成。
 
 用法:
-    python publish.py <video_id> [<video_id> ...] --site-repo <homepage_checkout>
-    python publish.py --all --site-repo <homepage_checkout>
-    python publish.py --migrate-layout --site-repo <homepage_checkout>
+    python publish.py <video_id> --site-repo <checkout> \\
+        --public-base-url https://example.org/project/ --content-dir lessons
+
+加 --exclude-transcripts 仅排除附件；摘要正文及来源署名仍须人工审核。
 """
 import argparse
 import json
@@ -20,7 +21,8 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from site_content import (content_path, prepare_note, prune_shared_assets, read_files,
                           replace_files, validate_note_paths)
-from site_index import build_course_pages, build_index_html, course_slug, session_number
+from site_index import (PublicationSite, build_course_pages, build_index_html,
+                        course_slug, session_number)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORRECTED = "transcript.corrected.txt"
@@ -91,8 +93,21 @@ def main():
     ap.add_argument("--all", action="store_true", help="发布 output/ 下所有含 book.html 的视频")
     ap.add_argument("--migrate-layout", action="store_true", help="只整理已经发布的笔记目录与资源，不读取本地视频产物")
     ap.add_argument("--course", type=str.strip, help="将所选笔记收录到指定课程；省略时保留已有课程归属")
-    ap.add_argument("--site-repo", required=True, help="个人主页仓库路径；将笔记写入 main 的 lessons/，生成 codex/publish-lessons 分支")
+    ap.add_argument("--site-repo", required=True, help="已确认的站点仓库路径；从所选分支准备本地 codex/publish-lessons 分支，不推送")
+    ap.add_argument("--site-branch", default="main", help="已确认的站点部署源分支，默认 main；也可显式指定 gh-pages")
+    ap.add_argument("--public-base-url", required=True, type=str.strip,
+                    help="与仓库根对应的公开网站根地址，例如 https://example.org/project/；必须先向用户确认")
+    ap.add_argument("--content-dir", required=True, type=str.strip,
+                    help="仓库内的笔记目录，例如 lessons 或 study/notes；不允许使用根目录")
+    ap.add_argument("--exclude-transcripts", action="store_true",
+                    help="排除所选笔记的字幕/文本附件并拒绝残留下载链接；原创摘要和来源署名仍须人工审核")
     args = ap.parse_args()
+    if not args.public_base_url:
+        ap.error("--public-base-url 不能为空")
+    try:
+        site = PublicationSite(args.public_base_url, args.content_dir)
+    except ValueError as error:
+        ap.error(str(error))
     if args.course == "":
         ap.error("--course 不能为空")
     if args.migrate_layout and (args.video_id or args.all or args.course is not None):
@@ -108,18 +123,23 @@ def main():
         sys.exit("没有可发布的视频：请提供 video_id 或使用 --all")
 
     for vid in ids:
+        if "/" in vid or "\\" in vid or vid in (".", ".."):
+            ap.error(f"video_id 必须是 output/ 下的单个目录名: {vid}")
         for filename in ("book.html", "book.md"):
             if not os.path.isfile(os.path.join(BASE, "output", vid, filename)):
                 sys.exit(f"output/{vid}/{filename} 不存在，先完成渲染步骤")
 
     repo = os.path.abspath(args.site_repo)
-    source_ref = "main"
+    source_ref = args.site_branch
     destination_ref = "codex/publish-lessons"
     git = lambda commands, **kwargs: run(commands, cwd=repo, **kwargs)
     git_dir = git(["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    valid_branch = git(["check-ref-format", "--branch", source_ref], check=False)
+    if valid_branch.returncode or valid_branch.stdout.strip() != source_ref or source_ref == destination_ref:
+        ap.error("--site-branch 必须是有效的分支名，且不能是 codex/publish-lessons")
     tip = branch_tip(source_ref, repo)
     if not tip:
-        sys.exit("个人主页仓库缺少 main 分支，请先同步主页仓库")
+        sys.exit(f"站点仓库缺少 {source_ref} 分支，请先确认并同步发布分支")
     checked_out = git(["symbolic-ref", "--short", "-q", "HEAD"], check=False).stdout.strip()
     if checked_out == destination_ref:
         sys.exit(f"请先切换离开 {destination_ref} 分支，避免修改当前工作区")
@@ -127,7 +147,7 @@ def main():
     if previous_destination:
         merged = git(["merge-base", "--is-ancestor", previous_destination, tip], check=False)
         if merged.returncode:
-            sys.exit("codex/publish-lessons 尚有未合入 main 的提交；请先完成该次发布并同步 main")
+            sys.exit(f"codex/publish-lessons 尚有未合入 {source_ref} 的提交；请先完成该次发布并同步 {source_ref}")
     tmp = tempfile.mkdtemp(prefix="videobook_publish_")
     env = {"GIT_INDEX_FILE": tmp + ".index"}  # 索引文件必须在工作树之外，否则会被 add 进提交
     g = lambda *a, **k: git(list(a), env=env, **k)
@@ -136,9 +156,13 @@ def main():
         # 1) 在临时工作树中保留主页和所有已发布笔记。
         g("--git-dir", git_dir, "--work-tree", tmp, "read-tree", tip)
         g("--git-dir", git_dir, "--work-tree", tmp, "checkout-index", "-a")
-        content_root = content_path(tmp, "lessons")
+        content_root = content_path(tmp, site.content_dir)
         os.makedirs(content_root, exist_ok=True)
-        manifest_path = "lessons/manifest.json"
+        manifest_path = site.content_dir + "/manifest.json"
+        if (content_root / "index.html").exists() and not (content_root / "manifest.json").is_file():
+            raise RuntimeError("目标目录已有非 VideoBook 首页，停止覆盖；请选择空的笔记目录")
+        if not content_path(tmp, "assets/site.css").is_file():
+            raise RuntimeError("站点缺少 assets/site.css，无法沿用现有站点样式；请先确认站点样式集成")
 
         # 2) 读旧 manifest
         manifest = {}
@@ -151,7 +175,7 @@ def main():
                     raise RuntimeError("已发布的 manifest.json 无法解析，停止发布以保留现有笔记") from error
 
         validate_note_paths(content_root, manifest)
-        previous_courses = build_course_pages(manifest)
+        previous_courses = build_course_pages(manifest, site=site)
         now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
         previous_manifest = manifest
         manifest = dict(previous_manifest)
@@ -181,7 +205,8 @@ def main():
             meta = manifest[vid]
             old = previous.get("folder")
             source = content_path(content_root, old) if args.migrate_layout else os.path.join(BASE, "output", vid)
-            files = prepare_note(source, meta, tmp, published=args.migrate_layout)
+            files = prepare_note(source, meta, tmp, published=args.migrate_layout,
+                                 site=site, exclude_transcripts=args.exclude_transcripts)
             unchanged = old and read_files(content_path(content_root, old)) == files
             meta["updated"] = previous.get("updated", now) if unchanged or args.migrate_layout else now
             meta["corrected"] = CORRECTED in files
@@ -198,11 +223,13 @@ def main():
             json.dump(manifest, f, ensure_ascii=False, indent=2)
             f.write("\n")
         with open(os.path.join(content_root, "index.html"), "w", encoding="utf-8") as f:
-            f.write(build_index_html(manifest))
-        course_pages = build_course_pages(manifest)
+            f.write(build_index_html(manifest, site=site))
+        course_pages = build_course_pages(manifest, site=site)
         for slug, page in course_pages.items():
             course_dir = content_path(content_root, f"courses/{slug}")
             os.makedirs(course_dir, exist_ok=True)
+            if (course_dir / "index.html").exists() and slug not in previous_courses:
+                raise RuntimeError(f"课程目录已有非 VideoBook 首页，停止覆盖: {slug}")
             with open(os.path.join(course_dir, "index.html"), "w", encoding="utf-8") as f:
                 f.write(page)
         for slug in previous_courses.keys() - course_pages.keys():
@@ -230,7 +257,10 @@ def main():
         except OSError:
             pass
 
-    print(f'\n完成。推送请执行: git -C "{repo}" push origin {destination_ref}:main')
+    print(f'\n本地发布提交已准备，尚未推送。目标目录: {site.content_dir}/')
+    print(f'站点源分支: {source_ref}；准备分支: {destination_ref}')
+    print(f'公开目录地址（仍需核实部署）: {site.canonical()}')
+    print('先审查差异、正文版权和来源署名，并确认仓库远端、公开地址及发布授权，再单独推送。')
 
 
 if __name__ == "__main__":

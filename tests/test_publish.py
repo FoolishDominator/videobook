@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import publish
-from site_index import build_course_pages, build_index_html
+from site_index import PublicationSite, build_course_pages, build_index_html
 
 
 class PublishTests(unittest.TestCase):
@@ -59,13 +59,15 @@ class PublishTests(unittest.TestCase):
 
     def prepare(self, *extra_args):
         with patch.object(publish, "BASE", str(self.source)), patch.object(sys, "argv", [
-            "publish.py", "test-video", "--site-repo", str(self.site), *extra_args,
+            "publish.py", "test-video", "--site-repo", str(self.site),
+            "--public-base-url", "https://example.invalid/", "--content-dir", "lessons", *extra_args,
         ]), patch("builtins.print"):
             publish.main()
 
-    def migrate(self):
+    def migrate(self, *extra_args):
         with patch.object(publish, "BASE", str(self.source)), patch.object(sys, "argv", [
             "publish.py", "--migrate-layout", "--site-repo", str(self.site),
+            "--public-base-url", "https://example.invalid/", "--content-dir", "lessons", *extra_args,
         ]), patch("builtins.print"):
             publish.main()
 
@@ -94,6 +96,151 @@ class PublishTests(unittest.TestCase):
         self.prepare()
         self.assertEqual(self.git(self.site, "rev-parse", "codex/publish-lessons"), tip)
         self.assertEqual(self.git(self.site, "status", "--porcelain"), "")
+
+    def test_cli_requires_explicit_public_url_and_content_directory(self):
+        for flags in ([], ["--public-base-url", "https://example.invalid/"],
+                      ["--content-dir", "lessons"]):
+            with self.subTest(flags=flags), patch.object(sys, "argv", [
+                "publish.py", "test-video", "--site-repo", str(self.site), *flags,
+            ]), patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                publish.main()
+            self.assertEqual(error.exception.code, 2)
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+
+    def test_unsafe_destination_configuration_is_rejected(self):
+        for url in ("file:///tmp/site", "//example.invalid/", "https://user:secret@example.invalid/",
+                    "https://example.invalid/?a=b", "https://example.invalid/#notes",
+                    "https://example.invalid/?", "https://example.invalid/#",
+                    "https://example.invalid/a/../b", "https://example.invalid/%2e%2e/b",
+                    "https://example.invalid/a\\b", "https://example.invalid/a//b", "https://"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                PublicationSite(url, "lessons")
+        for folder in ("", ".", "..", "/lessons", "../lessons", "a/../b", "a//b", "C:/notes", "a\\b", ".git"):
+            with self.subTest(folder=folder), self.assertRaises(ValueError):
+                PublicationSite("https://example.invalid/", folder)
+
+    def test_project_pages_prefix_and_custom_directory_cover_links_and_shared_assets(self):
+        self.write(self.video, "book.html", '<html><head><title>Notes</title></head><body>'
+                   '<article class="book-content"><p>Original summary</p>'
+                   '<script src="assets/mermaid.min.js"></script></article></body></html>')
+        self.write(self.video, "assets/mermaid.min.js", "/* Mermaid fixture */")
+        self.prepare("--public-base-url", "https://example.invalid/project/", "--content-dir", "study/notes",
+                     "--course", "Finance")
+        ref = "codex/publish-lessons"
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        asset = next(name for name in files if name.startswith("assets/vendor/mermaid-"))
+        note = self.git(self.site, "show", f"{ref}:study/notes/courses/finance/test-video/book.html")
+        self.assertIn('href="https://example.invalid/project/study/notes/courses/finance/test-video/book.html"', note)
+        self.assertIn('href="/project/study/notes/"', note)
+        self.assertIn('href="/project/study/notes/courses/finance/"', note)
+        self.assertIn(f'src="/project/{asset}"', note)
+        index = self.git(self.site, "show", f"{ref}:study/notes/index.html")
+        self.assertIn('href="/project/assets/site.css"', index)
+        self.assertIn('href="/project/"', index)
+        course = self.git(self.site, "show", f"{ref}:study/notes/courses/finance/index.html")
+        self.assertIn('href="/project/study/notes/courses/finance/test-video/book.md"', course)
+        self.assertIn('href="/project/study/notes/courses/finance/test-video/transcript.corrected.txt"', course)
+        self.assertNotIn("foolishdominator", index.lower() + note.lower() + course.lower())
+        self.assertEqual(self.git(self.site, "show", f"{ref}:index.html"), "Personal homepage")
+        self.assertEqual(self.git(self.site, "show", f"{ref}:assets/site.css"), "body { color: #25272b; }")
+        self.assertEqual(self.git(self.site, "show", f"{ref}:lessons/older/book.html"), "Existing notes")
+        self.git(self.site, "merge", "--ff-only", ref)
+        original = self.git(self.site, "rev-parse", ref)
+        self.migrate("--public-base-url", "https://example.invalid/project/", "--content-dir", "study/notes")
+        self.assertEqual(self.git(self.site, "rev-parse", ref), original)
+
+    def test_existing_unowned_landing_page_is_not_overwritten(self):
+        self.write(self.site, "study/index.html", "Existing custom landing page")
+        self.commit(self.site)
+        with self.assertRaisesRegex(RuntimeError, "停止覆盖"):
+            self.prepare("--content-dir", "study")
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+        self.assertEqual(self.git(self.site, "show", "HEAD:study/index.html"), "Existing custom landing page")
+
+    def test_missing_existing_stylesheet_aborts_instead_of_restyling_the_site(self):
+        (self.site / "assets/site.css").unlink()
+        self.commit(self.site)
+        with self.assertRaisesRegex(RuntimeError, "现有站点样式"):
+            self.prepare()
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+
+    def test_explicit_site_branch_is_used_without_touching_main(self):
+        main = self.git(self.site, "rev-parse", "main")
+        self.git(self.site, "checkout", "-b", "gh-pages")
+        self.write(self.site, "index.html", "Published branch homepage")
+        self.commit(self.site)
+        deployed = self.git(self.site, "rev-parse", "HEAD")
+        self.git(self.site, "checkout", "main")
+        self.prepare("--site-branch", "gh-pages")
+        ref = "codex/publish-lessons"
+        self.assertEqual(self.git(self.site, "rev-parse", ref + "^"), deployed)
+        self.assertEqual(self.git(self.site, "rev-parse", "main"), main)
+        self.assertEqual(self.git(self.site, "show", f"{ref}:index.html"), "Published branch homepage")
+
+    def test_invalid_or_publisher_source_branch_is_rejected(self):
+        for branch in ("../main", "main:notes", "codex/publish-lessons", "HEAD"):
+            with self.subTest(branch=branch), patch("sys.stderr"), self.assertRaises(SystemExit):
+                self.prepare("--site-branch", branch)
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+
+    def test_exclude_transcripts_removes_attachments_and_generated_download_links(self):
+        self.write(self.video, "transcript.translated.txt", "Translation fixture")
+        self.write(self.video, "assets/transcript.copy.pdf", "Transcript attachment fixture")
+        self.write(self.video, "assets/captions.vtt", "Subtitle fixture")
+        self.prepare("--exclude-transcripts", "--course", "Finance")
+        ref = "codex/publish-lessons"
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        self.assertFalse(any("transcript" in name or "captions" in name for name in files))
+        manifest = json.loads(self.git(self.site, "show", f"{ref}:lessons/manifest.json"))
+        self.assertFalse(manifest["test-video"]["corrected"])
+        course = self.git(self.site, "show", f"{ref}:lessons/courses/finance/index.html")
+        self.assertNotIn("字幕对照", course)
+        self.assertNotIn("transcript", course)
+        self.assertIn("book.md", course)
+        self.assertTrue((self.video / "transcript.corrected.txt").is_file())
+
+    def test_exclude_transcripts_fails_closed_on_remaining_html_and_markdown_links(self):
+        for name, content in (
+            ("book.html", '<a href="transcript.corrected.txt">Transcript</a>'),
+            ("book.html", '<a href=transcript.corrected.txt?download=1>Transcript</a>'),
+            ("book.html", '<a href="transcript%2Etranslated%2Etxt">Translation</a>'),
+            ("book.html", '<a href="assets/captions.vtt">Captions</a>'),
+            ("book.html", '<img srcset="assets/captions.vtt 1x">'),
+            ("book.md", '[Transcript](transcript.corrected.txt "Download")'),
+            ("book.md", '[Download](<assets/full text.txt>)'),
+            ("book.md", '[download]: transcript.corrected.txt\n[Transcript][download]'),
+            ("book.md", '<a href="transcript.corrected.txt">Transcript</a>'),
+        ):
+            with self.subTest(name=name, content=content):
+                old = (self.video / name).read_text(encoding="utf-8")
+                self.write(self.video, name, content)
+                with self.assertRaisesRegex(ValueError, "仍引用"):
+                    self.prepare("--exclude-transcripts")
+                self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+                self.write(self.video, name, old)
+
+    def test_exclude_transcripts_republication_removes_old_downloads(self):
+        self.prepare()
+        ref = "codex/publish-lessons"
+        self.git(self.site, "merge", "--ff-only", ref)
+        self.prepare("--exclude-transcripts")
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        self.assertNotIn("lessons/notes/test-video/transcript.corrected.txt", files)
+        self.assertNotIn("字幕对照", self.git(self.site, "show", f"{ref}:lessons/index.html"))
+        self.git(self.site, "merge", "--ff-only", ref)
+        original = self.git(self.site, "rev-parse", ref)
+        self.prepare("--exclude-transcripts")
+        self.assertEqual(self.git(self.site, "rev-parse", ref), original)
+
+    def test_exclude_transcripts_also_applies_to_migration(self):
+        self.prepare()
+        ref = "codex/publish-lessons"
+        self.git(self.site, "merge", "--ff-only", ref)
+        self.write(self.site, "lessons/notes/test-video/transcript.translated.txt", "Published translation")
+        self.commit(self.site)
+        self.migrate("--exclude-transcripts")
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        self.assertFalse(any("transcript" in name for name in files))
 
     def test_pending_publication_is_not_overwritten(self):
         self.prepare()

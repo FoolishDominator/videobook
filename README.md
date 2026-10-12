@@ -38,7 +38,7 @@ uv sync --locked --extra asr
 # pip 环境对应：python -m pip install -e ".[asr]"
 ```
 
-浏览器截帧需要已安装 Chrome。专用配置的一次性登录：
+浏览器截帧需要已安装 Chrome；Linux 也支持 Chromium。登录、截帧与 cookies 工具共用同一浏览器选择，可用 `VIDEOBOOK_BROWSER_EXECUTABLE` 指定可执行文件路径。专用配置的一次性登录：
 
 ```powershell
 uv run python src/capture_frames.py --setup-profile
@@ -78,7 +78,7 @@ python src/pipeline.py serve <video_id>
 
 完整流程生成 `transcript.corrected.txt`、`corrections.json`、`translation.json`、`book.tagged.md`、`book.md`、`images/` 和 `book.html`。需要翻译时另存 `transcript.translated.txt`，保留原语言订正稿；无需翻译时在 `translation.json` 记录相同的源语言和目标语言并沿用订正稿。`run.json` 记录检查点；原始字幕供追溯与恢复。每次生成或发布验证完成后执行[清理约定](.agents/skills/videobook/references/cleanup.md)，将临时截图、下载媒体等送入系统回收站。`python src/cleanup.py <video_id>` 预览清单，添加 `--apply` 执行。旧任务恢复时需补齐 `translated` 阶段并复核后续产物，已有成品保留。
 
-本地生成完成后，需要发布时明确告诉助手。公开课程笔记发布到个人主页的 [Lessons](https://foolishdominator.github.io/lessons/)，与主页共用样式；本仓库用于生成笔记。发布命令需要通过 `--site-repo` 指定主页仓库的本地路径，操作见 [发布说明](.agents/skills/videobook/references/publishing.md)。
+本地生成完成后，需要发布时明确告诉助手。每次发布前确认目标仓库、分支、公开地址和内容范围；不默认使用历史 Lessons 地址。本仓库用于生成笔记。发布命令必须通过 `--site-repo`、`--public-base-url` 和 `--content-dir` 指定目的地，`--site-branch` 指定已确认的分支；操作见 [发布说明](.agents/skills/videobook/references/publishing.md)。原创摘要可用 `--exclude-transcripts` 排除字幕附件，但仍须人工复核正文。
 
 发布后的笔记按课程和固定课时目录组织，修改标题保留网址。课程归属与已有站点迁移统一由发布脚本维护，具体命令见上述发布说明。
 
@@ -91,3 +91,7 @@ python -m unittest discover -s tests
 检查覆盖字幕修改追溯、译稿对应关系与版本、缺图与占位符、检查点失效和本地预览。实际字幕获取、登录画质和 AI 编辑质量需要在生成任务中验证。
 
 浏览器截帧回归测试使用本地生成的视频检查就绪等待、页面重试、画质菜单和原生尺寸；安装 Chrome 时自动运行，无 Chrome 时跳过，不访问在线视频。
+
+## 云端运行
+
+云端准备、CPU ASR、Windows/Linux 可恢复清理、逐次确认发布地址与内容权限检查见 [Cloud operations](docs/CLOUD_OPERATIONS.md)。浏览器受宿主权限限制时保留检查点并报告，不绕过安全限制。

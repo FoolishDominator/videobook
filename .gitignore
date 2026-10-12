@@ -34,3 +34,4 @@ memory/
 # exported cookies (never commit login state)
 cookies.txt
 *.cookies.txt
+.recycle-archive/

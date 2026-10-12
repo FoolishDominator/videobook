@@ -8,6 +8,8 @@ Windows 上因 Chrome 新版 App-Bound 加密（DPAPI v20）无法解密主 Chro
 import os
 import tempfile
 
+from browser_config import browser_launch_options
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROFILE_DIR = os.path.join(BASE_DIR, ".capture-profile")
 
@@ -31,7 +33,7 @@ def export_cookies(profile_dir=DEFAULT_PROFILE_DIR, out_path=None, platform="bil
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            profile_dir, channel="chrome", headless=True)
+            profile_dir, **browser_launch_options(), headless=True)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto(_HOME.get(platform, _HOME["bilibili"]),
