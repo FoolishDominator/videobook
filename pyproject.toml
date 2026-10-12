@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-asr = ["faster-whisper>=1.0.0"]
+asr = ["faster-whisper>=1.0.0", "av>=11,<19", "socksio>=1.0.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -8,8 +8,10 @@ confirm the publication destination, and perform an authorized publication.
 The Python CLI handles deterministic acquisition, capture, rendering and validation.
 
 The cloud preparation used Python 3.12 and the locked `asr` extra. CPU support was
-verified by importing faster-whisper/CTranslate2; model weights have not yet been
-downloaded, and transcription on a real video has not been tested.
+verified by importing faster-whisper/CTranslate2 and decoding synthetic WAV audio.
+The ASR extra pins PyAV below 19 for faster-whisper 1.2.x compatibility and includes
+SOCKS proxy support. Official model weights are downloaded on demand; actual
+transcription quality and language still require a short sample for each source.
 
 Windows and Linux cleanup dispatch is covered with synthetic fixtures. A real Linux
 synthetic-trash smoke test failed safely because `/workspace/.Trash-1000` is
