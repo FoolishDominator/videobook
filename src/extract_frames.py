@@ -20,9 +20,8 @@ After extraction the markdown is materialized: every placeholder in book.md
 is replaced with a native image link ![desc](images/shot_HH_MM_SS.png), and
 the original tagged draft is kept once as book.tagged.md.
 
-The downloaded video source is a fallback-only media file. It stays on disk
-after extraction so failed frames can be retried; at the end of the whole
-workflow the agent asks the user whether to delete such large media files.
+The downloaded source remains available for failed-frame retries. After the
+book is verified, src/cleanup.py recycles it under the workflow cleanup policy.
 """
 import os
 import re

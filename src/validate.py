@@ -1,6 +1,7 @@
 """Offline artifact checks; editorial and screenshot quality remain agent reviews."""
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -9,7 +10,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-STAGES = ("transcript", "corrected", "book", "images", "html")
+STAGES = ("transcript", "corrected", "translated", "book", "images", "html")
 PLACEHOLDER = re.compile(r"!\[([^\]]*)\]\(SCREENSHOT:(\d{2}:\d{2}:\d{2})\)")
 IMAGE = re.compile(r"!\[[^\]]*\]\(([^\s)]+)\)")
 
@@ -105,6 +106,32 @@ def validate_corrected(directory, data):
             expected.append(f"[{start // 60:02d}:{start % 60:02d}] {text}")
     actual = read_text(directory / "transcript.corrected.txt").splitlines()
     require(actual == expected, "Corrected transcript differs from the reviewed decisions (missing, reordered, or unrecorded edits)")
+    return actual
+
+
+def validate_translated(directory, data):
+    corrected = validate_corrected(directory, data)
+    record = read_json(directory / "translation.json")
+    require(isinstance(record, dict), "translation.json must be an object")
+    languages = []
+    for field in ("source_language", "target_language"):
+        value = record.get(field)
+        require(isinstance(value, str) and re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", value), f"Invalid {field} in translation.json")
+        languages.append(value.lower())
+    signature = hashlib.sha256((directory / "transcript.corrected.txt").read_bytes()).hexdigest()
+    require(record.get("source_sha256") == signature, "Translation source changed; review against the current corrected transcript")
+    require(record.get("review", {}).get("full_read") is True, "Translation review must be completed")
+    require(isinstance(record.get("glossary"), dict) and isinstance(record.get("uncertain"), list), "Missing translation glossary or uncertainty list")
+    if languages[0] == languages[1]:
+        return "transcript.corrected.txt"
+    translated = read_text(directory / "transcript.translated.txt").splitlines()
+    require(len(translated) == len(corrected), "Translation must preserve every corrected segment")
+    for index, (source, target) in enumerate(zip(corrected, translated), 1):
+        match = re.fullmatch(r"(\[\d{2,}:\d{2}\]) (.+)", target)
+        require(match and match[1] == source.split(" ", 1)[0], f"Translation timestamp differs at line {index}")
+        require(match[2].strip() and "\ufffd" not in target, f"Invalid translation text at line {index}")
+    require(translated != corrected, "Translation is an unchanged copy of the corrected transcript")
+    return "transcript.translated.txt"
 
 
 def validate_book(directory, data):
@@ -149,6 +176,8 @@ def validate_stage(directory, stage):
         data, warnings = validate_transcript(directory)
         if stage == "corrected":
             validate_corrected(directory, data)
+        if stage in ("translated", "book", "images", "html"):
+            validate_translated(directory, data)
         if stage in ("book", "images", "html"):
             tagged = validate_book(directory, data)
         if stage in ("images", "html"):

@@ -1,6 +1,7 @@
 """Offline integration checks for artifacts, resumption, and localhost previews."""
 
 import base64
+import hashlib
 import json
 import subprocess
 import sys
@@ -28,7 +29,7 @@ class WorkflowTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.directory = self.root / "output" / "BV1kybV6DE47"
         (self.directory / "images").mkdir(parents=True)
-        for name in ("prompts/correct_transcript.md", "prompts/stitcher_system.md", "src/post_process.py"):
+        for name in ("prompts/correct_transcript.md", "prompts/translate_transcript.md", "prompts/stitcher_system.md", "src/post_process.py"):
             path = self.root / name
             path.parent.mkdir(exist_ok=True)
             path.write_text("Fixture rules\n", encoding="utf-8")
@@ -53,6 +54,7 @@ class WorkflowTests(unittest.TestCase):
         self.write_json("transcript.json", self.source)
         self.write_json("corrections.json", self.ledger)
         self.write("transcript.corrected.txt", "[00:00] 我来演示\n[00:30] 这是结果\n")
+        self.record_translation("zh", "zh")
         self.write("book.tagged.md", "# 示例书籍\n\n## 演示\n\n![操作](SCREENSHOT:00:00:10)\n")
         self.write("book.md", "# 示例书籍\n\n## 演示\n\n![操作](images/shot_00_00_10.png)\n")
         (self.directory / "images" / "shot_00_00_10.png").write_bytes(PNG)
@@ -64,6 +66,28 @@ class WorkflowTests(unittest.TestCase):
 
     def write_json(self, name, value):
         self.write(name, json.dumps(value, ensure_ascii=False))
+
+    def record_translation(self, source_language, target_language):
+        self.write_json("translation.json", {
+            "source_language": source_language,
+            "target_language": target_language,
+            "source_sha256": hashlib.sha256((self.directory / "transcript.corrected.txt").read_bytes()).hexdigest(),
+            "review": {"full_read": True},
+            "glossary": {},
+            "uncertain": [],
+        })
+
+    def use_english_transcript(self):
+        self.source["segments"][0]["text"] = "I I will demonstrate."
+        self.source["segments"][1]["text"] = "This is the result."
+        self.ledger["changes"] = [{
+            "segment": 1, "old": "I I will demonstrate.", "new": "I will demonstrate.", "reason": "Remove stutter",
+        }]
+        self.write_json("transcript.json", self.source)
+        self.write_json("corrections.json", self.ledger)
+        self.write("transcript.corrected.txt", "[00:00] I will demonstrate.\n[00:30] This is the result.\n")
+        self.record_translation("en", "zh")
+        self.write("transcript.translated.txt", "[00:00] 我来演示。\n[00:30] 这是结果。\n")
 
     def mark(self, through="html"):
         for stage in STAGES[:STAGES.index(through) + 1]:
@@ -87,9 +111,103 @@ class WorkflowTests(unittest.TestCase):
             pipeline.checkpoint(self.directory, "html", self.root)
 
     def test_transcript_only_mode_finishes_after_correction(self):
+        self.use_english_transcript()
+        (self.directory / "translation.json").unlink()
+        (self.directory / "transcript.translated.txt").unlink()
         self.mark("corrected")
         self.assertTrue(self.status("transcript")["complete"])
+        self.assertEqual(self.status()["next_stage"], "translated")
+
+    def test_english_book_requires_reviewed_translation_before_compilation(self):
+        self.use_english_transcript()
+        translated = (self.directory / "transcript.translated.txt").read_text(encoding="utf-8")
+        (self.directory / "transcript.translated.txt").unlink()
+        self.mark("corrected")
+        self.assertFalse(validate_stage(self.directory, "book")["ok"])
+        with self.assertRaisesRegex(ValueError, "preceding stages"):
+            pipeline.checkpoint(self.directory, "book", self.root)
+        with self.assertRaises(ValueError):
+            pipeline.checkpoint(self.directory, "translated", self.root)
+        self.write("transcript.translated.txt", translated)
+        self.mark()
+        self.assertTrue(self.status()["complete"])
+
+    def test_missing_reordered_and_untranslated_segments_are_rejected(self):
+        self.use_english_transcript()
+        for content in (
+            "[00:00] 我来演示。\n",
+            "[00:30] 这是结果。\n[00:00] 我来演示。\n",
+            "[00:01] 我来演示。\n[00:30] 这是结果。\n",
+            "[00:00] 我来演示。\n[00:30]   \n",
+            (self.directory / "transcript.corrected.txt").read_text(encoding="utf-8"),
+        ):
+            with self.subTest(content=content):
+                self.write("transcript.translated.txt", content)
+                self.assertFalse(validate_stage(self.directory, "translated")["ok"])
+
+    def test_updated_correction_requires_translation_to_be_reviewed_again(self):
+        self.use_english_transcript()
+        self.mark()
+        self.ledger["changes"][0]["new"] = "I will demonstrate!"
+        self.write_json("corrections.json", self.ledger)
+        self.write("transcript.corrected.txt", "[00:00] I will demonstrate!\n[00:30] This is the result.\n")
+        self.assertEqual(self.status()["next_stage"], "corrected")
+        pipeline.checkpoint(self.directory, "corrected", self.root)
+        with self.assertRaisesRegex(ValueError, "Translation source changed"):
+            pipeline.checkpoint(self.directory, "translated", self.root)
+
+    def test_translation_edits_invalidate_downstream_checkpoints(self):
+        self.use_english_transcript()
+        self.mark()
+        self.write("transcript.translated.txt", "[00:00] 我将进行演示。\n[00:30] 这是结果。\n")
+        state = self.status()
+        self.assertEqual(state["next_stage"], "translated")
+        self.assertTrue(all(item["status"] == "stale" for item in state["stages"][2:]))
+        pipeline.checkpoint(self.directory, "translated", self.root)
         self.assertEqual(self.status()["next_stage"], "book")
+
+    def test_translation_rules_invalidate_translation_and_downstream_stages(self):
+        self.use_english_transcript()
+        self.mark()
+        (self.root / "prompts" / "translate_transcript.md").write_text("Changed rules", encoding="utf-8")
+        state = self.status()
+        self.assertEqual(state["next_stage"], "translated")
+        self.assertTrue(all(item["status"] == "stale" for item in state["stages"][2:]))
+
+    def test_matching_languages_reuse_correction_and_ignore_old_translation(self):
+        for language in ("zh", "en"):
+            with self.subTest(language=language):
+                if language == "en":
+                    self.use_english_transcript()
+                self.record_translation(language, language)
+                self.write("transcript.translated.txt", "Old unused translation")
+                self.mark()
+                self.write("transcript.translated.txt", "Changed unused translation")
+                self.assertTrue(self.status()["complete"])
+
+    def test_old_checkpoints_resume_translation_without_overwriting_books(self):
+        self.mark()
+        book = (self.directory / "book.html").read_bytes()
+        state = json.loads((self.directory / "run.json").read_text(encoding="utf-8"))
+        del state["stages"]["translated"]
+        self.write_json("run.json", state)
+        (self.directory / "translation.json").unlink()
+        self.assertEqual(self.status()["next_stage"], "translated")
+        self.assertEqual((self.directory / "book.html").read_bytes(), book)
+        self.record_translation("zh", "zh")
+        pipeline.checkpoint(self.directory, "translated", self.root)
+        self.assertTrue(self.status()["complete"])
+
+    def test_invalid_or_unreviewed_translation_record_is_reported(self):
+        self.use_english_transcript()
+        self.mark("corrected")
+        record = json.loads((self.directory / "translation.json").read_text(encoding="utf-8"))
+        for invalid in ([], {**record, "source_language": None}, {**record, "review": {"full_read": False}}):
+            with self.subTest(record=invalid):
+                self.write_json("translation.json", invalid)
+                state = self.status()
+                self.assertEqual(state["next_stage"], "translated")
+                self.assertFalse(state["stages"][2]["ok"])
 
     def test_changed_prompt_invalidates_dependent_stages(self):
         self.mark()

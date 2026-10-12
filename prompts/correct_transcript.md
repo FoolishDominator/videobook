@@ -1,6 +1,6 @@
 # 字幕订正规范
 
-输入为原始 `transcript.json`，输出为 `transcript.corrected.txt` 与可追溯的 `corrections.json`。此阶段保留原语言和原话，电子书的书面化改写在下一阶段完成。
+输入为原始 `transcript.json`，输出为 `transcript.corrected.txt` 与可追溯的 `corrections.json`。此阶段保留原语言和原话；翻译及电子书的书面化改写分别在后续阶段完成。
 
 ## 编辑边界
 

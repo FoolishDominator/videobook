@@ -1,61 +1,48 @@
-"""Primary frame materialization: screenshots taken directly from the platform
-player in a logged-in browser (high quality, from the platform).
+"""Capture the platform player's decoded video directly, without media downloads.
 
 Usage:
     python capture_frames.py --setup-profile
     python capture_frames.py <video_id> [video_url] [--method auto|dedicated]
-                             [--materialize-only] [--profile-dir PATH]
+                             [--materialize-only] [--profile-dir PATH] [--recapture]
 
-Capture method (project policy, Chrome >= 136 compatible):
-  dedicated  Playwright launches Chrome with a DEDICATED user-data-dir
-             (<repo>/.capture-profile by default). Chrome forbids any remote
-             debugging (port or pipe) on the DEFAULT user-data-dir since
-             v136, so this profile is initialized once via --setup-profile:
-             log in to the platforms (bilibili / YouTube) one time and the
-             cookies persist for unattended captures afterwards. The dedicated
-             directory does not conflict with your daily Chrome (both can run
-             at the same time).
-
-  v2 pipeline layers (see .agents/skills/videobook/references/capture.md):
-    A 启动层   headless 优先，失败回退 headful；不弹窗打扰。
-    B 探针层   抓取前查询 playurl，取顶档原生分辨率，viewport 1:1 设置（不自嗨放大）。
-    C 流锁定层 路由拦截 playurl 响应，只保留顶档最高码率变体（优先 AVC），
-              根除"自动档从 360P 起播、暂停冻结升档"导致的糊图。
-    D 页面层   默认嵌入播放器 player.html（轻量）；video 选择器超时自动降级主站观看页。
-    E 截帧层   seek(t) -> await seeked -> pause -> <video> 元素截图；
-              visibility CSS 隐藏一切非 video 元素（顶栏/控制栏/引流条/推荐层/黑边 UI）。
-    F QA 层    截图文件过小视为黑帧，偏移 +2s 自动重试一次。
-
-Deliberately excluded (project policy): the Codex/ChatGPT in-app browser
-(separate profile, not logged in), a clean Playwright-managed Chromium
-(not logged in), win32 screen capture (takes over the screen), and any remote
-debugging against the DEFAULT Chrome profile (blocked by Chrome >= 136). When
-running inside the Codex desktop app, prefer the ChatGPT browser extension
-(@Chrome) over this script; see .agents/skills/videobook/references/capture.md.
-
-No video or audio file is downloaded by any browser method.
-
-After capturing, the SCREENSHOT placeholders in book.md are materialized into
-images/shot_HH_MM_SS.png links (same naming post_process.py expects), and the
-original tagged draft is kept as book.tagged.md.
+Uses a dedicated Chrome profile and records quality, decoded size, exact time,
+and failures in capture.json. Workflow and fallback policy live in
+.agents/skills/videobook/references/capture.md.
 """
 import argparse
+import json
 import os
 import re
+import shutil
+import struct
 import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from extract_frames import materialize
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROFILE_DIR = os.path.join(BASE_DIR, ".capture-profile")
 
-# E 层：除 <video> 外全部隐藏（visibility 保留布局，通杀各遮挡层）
+# Hide player chrome while preserving the original video element.
 HIDE_CSS = ("body *{visibility:hidden!important}"
             "video, video *{visibility:visible!important}")
 
-# F 层：纯黑/空帧 PNG 压缩后极小，真实 lecture 帧通常 > 50KB
+# A size threshold flags suspicious frames; visual review remains necessary.
 MIN_SHOT_BYTES = 10000
+READY_TIMEOUT_MS = 30000
+SEEK_TIMEOUT_MS = 15000
+
+VIDEO_STATE = """() => {
+    const v = document.querySelector('video');
+    return v ? {width:v.videoWidth, height:v.videoHeight, time:v.currentTime,
+        ready:v.readyState, paused:v.paused, seeking:v.seeking,
+        error:v.error ? v.error.message : null,
+        advertisement:!!document.querySelector('.ad-showing, .ad-interrupting')} : null;
+}"""
 
 
 def detect_platform(video_id: str, video_url: str) -> str:
@@ -141,7 +128,7 @@ def setup_profile(profile_dir: str, open_url: str = "https://www.bilibili.com") 
 
 
 # ─────────────────────────────────────────────
-# v2 pipeline internals
+# Player capture internals
 # ─────────────────────────────────────────────
 
 def _force_top_quality(page):
@@ -177,55 +164,182 @@ def _probe_native_size(page, video_id):
         return None
 
 
-def _shoot(page, sec, name, imgdir, urls):
-    """D+E+F 层：embed 优先/主站兜底；精确 seek+pause；元素截图；黑帧重试。"""
-    loaded = False
+def _wait_for_video(page):
+    """Wait on decoded video, not unrelated scripts blocking DOMContentLoaded."""
+    page.wait_for_selector("video", state="attached", timeout=READY_TIMEOUT_MS)
+    page.evaluate("""() => { const v=document.querySelector('video');
+        v.muted=true; v.play().catch(()=>{}); }""")
+    page.wait_for_function("""() => { const v=document.querySelector('video');
+        return v && (v.error || (v.readyState>=2 && v.videoWidth>0 &&
+            !document.querySelector('.ad-showing, .ad-interrupting'))); }""",
+        timeout=READY_TIMEOUT_MS)
+    state = page.evaluate(VIDEO_STATE)
+    if state["error"]:
+        raise RuntimeError("Video decoder: " + state["error"])
+    return state
+
+
+def _select_youtube_quality(page):
+    """Choose the highest enabled resolution in the actual player menu."""
+    page.locator("video").hover()
+    page.locator(".ytp-settings-button").click(timeout=10000)
+    page.locator(".ytp-panel-menu:visible .ytp-menuitem").filter(
+        has_text=re.compile(r"画质|畫質|清晰度|Quality", re.I)).click(timeout=10000)
+    options = page.locator('.ytp-panel-menu:visible [role="menuitemradio"]')
+    options.first.wait_for(state="visible", timeout=10000)
+    choices = options.evaluate_all("""items => items.map((item,index)=>({
+        index, label:item.innerText.trim(), disabled:item.getAttribute('aria-disabled')==='true'
+    }))""")
+    available = []
+    for item in choices:
+        resolution = re.search(r"(\d{3,4})\s*p", item["label"], re.I)
+        if resolution and not item["disabled"]:
+            available.append({**item, "height": int(resolution.group(1))})
+    if not available:
+        raise RuntimeError("YouTube did not expose selectable quality levels")
+    selected = max(available, key=lambda item: item["height"])
+    options.nth(selected["index"]).click(timeout=10000)
+    # Keep playing until the decoder has switched, then seek/pause for capture.
+    page.wait_for_function("""height => { const v=document.querySelector('video');
+        return v && v.readyState>=2 && Math.min(v.videoWidth,v.videoHeight)>=height;
+    }""", arg=selected["height"], timeout=READY_TIMEOUT_MS)
+    return {"selected": selected["label"], "height": selected["height"],
+            "available": [item["label"] for item in available]}
+
+
+def _seek_frame(page, sec):
+    """Bound every wait; install listeners before seeking; wait for decoded paint."""
+    page.evaluate("""async ({target, timeout}) => {
+        const v=document.querySelector('video');
+        if (!v || v.error) throw new Error('Video is unavailable');
+        if (!Number.isFinite(v.duration) || target<0 || target>=v.duration)
+            throw new Error('Timestamp is outside the video');
+        v.muted=true; v.pause();
+        const seekNeeded=Math.abs(v.currentTime-target)>0.01 || v.seeking;
+        await new Promise((resolve,reject)=>{
+            let frame=null, interval=null, timer=null, painted=!seekNeeded;
+            const cleanup=()=>{ clearTimeout(timer); clearInterval(interval);
+                v.removeEventListener('seeked',check); v.removeEventListener('error',failed);
+                if(frame!==null) v.cancelVideoFrameCallback?.(frame); };
+            const failed=()=>{cleanup();reject(new Error('Video decoder failed during seek'));};
+            const check=()=>{
+                if(v.error) return failed();
+                if(!v.seeking && v.readyState>=2 && Math.abs(v.currentTime-target)<=0.01 && painted){
+                    cleanup(); resolve();
+                }
+            };
+            timer=setTimeout(()=>{cleanup();reject(new Error('Timed out waiting for target video frame'));},timeout);
+            interval=setInterval(check,50);
+            v.addEventListener('seeked',check); v.addEventListener('error',failed);
+            if(seekNeeded && v.requestVideoFrameCallback){
+                const onFrame=(_,meta)=>{
+                    painted=Math.abs(meta.mediaTime-target)<0.15;
+                    if(!painted) frame=v.requestVideoFrameCallback(onFrame);
+                    check();
+                };
+                frame=v.requestVideoFrameCallback(onFrame);
+            } else painted=true;
+            if(seekNeeded) v.currentTime=target;
+            check();
+        });
+        await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    }""", {"target": sec, "timeout": SEEK_TIMEOUT_MS})
+    return page.evaluate(VIDEO_STATE)
+
+
+def _native_screenshot(page, path, state):
+    """Render the decoded pixels 1:1, without player controls or CSS upscaling."""
+    width, height = state["width"], state["height"]
+    page.set_viewport_size({"width": width, "height": height})
+    page.add_style_tag(content=HIDE_CSS + """
+        html,body { margin:0!important; overflow:hidden!important; }
+        video { position:fixed!important; left:0!important; top:0!important;
+            max-width:none!important; max-height:none!important; min-width:0!important;
+            min-height:0!important; transform:none!important; object-fit:fill!important;
+            border:0!important; border-radius:0!important; z-index:2147483647!important; }
+        """ + f"video {{ width:{width}px!important; height:{height}px!important; }}")
+    page.evaluate("""() => {
+        const video=document.querySelector('video');
+        const setStyle=(element,key,value)=>element.setAttribute('style',
+            (element.getAttribute('style')||'')+';'+key+':'+value+'!important;');
+        // Visibility can be overridden by a control's own !important rule.
+        // Hide each sibling branch by opacity; children cannot opt back in.
+        for(const element of document.querySelectorAll('body *')){
+            if(element!==video && !element.contains(video))
+                setStyle(element,'opacity','0');
+        }
+        for(let p=video.parentElement;p;p=p.parentElement){
+            for(const [key,value] of Object.entries({overflow:'visible',transform:'none',
+                    contain:'none','clip-path':'none',filter:'none','border-radius':'0'}))
+                setStyle(p,key,value);
+        }
+        setStyle(document.documentElement,'overflow','hidden');
+        setStyle(document.body,'overflow','hidden');
+    }""")
+    page.locator("video").screenshot(path=str(path), scale="css", timeout=10000)
+    header = Path(path).read_bytes()[:24]
+    if header[:8] != b"\x89PNG\r\n\x1a\n" or struct.unpack(">II", header[16:24]) != (width, height):
+        raise RuntimeError("Screenshot dimensions do not match decoded video")
+
+
+def _shoot(page, sec, name, imgdir, urls, platform="", report=None):
+    """Try the entire capture on each page; retain originals until replacement is valid."""
     for url in urls:
+        stage = "navigation"
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_selector("video", timeout=20000)
-            loaded = True
-            break
-        except Exception:
-            continue
-    if not loaded:
-        return False
-    page.add_style_tag(content=HIDE_CSS)
-    page.evaluate("""async (sec) => {
-        const v = document.querySelector('video');
-        v.muted = true;
-        await new Promise(r => (v.readyState >= 2) ? r() : v.addEventListener('loadeddata', r, {once:true}));
-        v.currentTime = sec;
-        await new Promise(r => v.addEventListener('seeked', r, {once:true}));
-        v.pause();
-    }""", sec)
-    page.wait_for_timeout(500)
-    page.add_style_tag(content=HIDE_CSS)
-    path = os.path.join(imgdir, name + ".png")
-    page.locator("video").screenshot(path=path)
-    if os.path.getsize(path) < MIN_SHOT_BYTES:
-        print("  QA: black frame detected, retry at +2s")
-        page.evaluate("""async (sec) => {
-            const v = document.querySelector('video');
-            v.currentTime = sec + 2;
-            await new Promise(r => v.addEventListener('seeked', r, {once:true}));
-            v.pause();
-        }""", sec)
-        page.wait_for_timeout(500)
-        page.locator("video").screenshot(path=path)
-    print("saved", name + ".png")
-    return True
+            page.goto(url, wait_until="commit", timeout=45000)
+            stage = "video readiness"
+            _wait_for_video(page)
+            stage = "highest quality"
+            quality = _select_youtube_quality(page) if platform == "youtube" else None
+            stage = "seek"
+            state = _seek_frame(page, sec)
+            if quality and min(state["width"], state["height"]) < quality["height"]:
+                raise RuntimeError("Decoded resolution fell below selected quality")
+            stage = "screenshot"
+            with tempfile.TemporaryDirectory(prefix="capture_", dir=Path(imgdir).parent) as temp:
+                pending = Path(temp) / (name + ".png")
+                _native_screenshot(page, pending, state)
+                if pending.stat().st_size < MIN_SHOT_BYTES:
+                    # A small PNG is suspicious, but never silently change its timestamp.
+                    state = _seek_frame(page, sec)
+                    _native_screenshot(page, pending, state)
+                    if pending.stat().st_size < MIN_SHOT_BYTES:
+                        raise RuntimeError("Suspiciously small frame; visual inspection required")
+                final_state = page.evaluate(VIDEO_STATE)
+                if (not final_state["paused"] or abs(final_state["time"]-sec)>0.05
+                        or [final_state["width"], final_state["height"]] != [state["width"], state["height"]]):
+                    raise RuntimeError("Video changed during screenshot")
+                destination = Path(imgdir) / (name + ".png")
+                if destination.exists():
+                    backup = Path(imgdir).parent / "_capture_backups" / str(time.time_ns())
+                    backup.mkdir(parents=True)
+                    shutil.copy2(destination, backup / destination.name)
+                os.replace(pending, destination)
+            if report is not None:
+                report["frames"][name] = {"requested_seconds": sec, "actual_seconds": final_state["time"],
+                    "decoded_size": [state["width"], state["height"]], "quality": quality,
+                    "url": url, "method": "browser"}
+            print(f"saved {name}.png: {state['width']}x{state['height']} at {final_state['time']:.3f}s", flush=True)
+            return True
+        except Exception as error:
+            message = str(error).split("Call log:")[0].strip().splitlines()[0][:400]
+            print(f"  {name}: {stage} failed on {urlsplit(url).path}: {message}", flush=True)
+            if report is not None:
+                report["attempts"].append({"frame": name, "url": url, "stage": stage, "error": message})
+    return False
 
 
-def _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless):
+def _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless, report=None):
     ctx = p.chromium.launch_persistent_context(
         profile_dir, channel="chrome", headless=headless,
         viewport={"width": 1280, "height": 720},
+        device_scale_factor=1,
         args=["--autoplay-policy=no-user-gesture-required"])
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        _force_top_quality(page)
         if platform == "bilibili":
+            _force_top_quality(page)
             page.goto("https://www.bilibili.com", wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(1000)
             dims = _probe_native_size(page, video_id)
@@ -234,16 +348,23 @@ def _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless):
                 page.set_viewport_size({"width": dims[0], "height": dims[1]})
         ok_all = True
         for sec, name, embed, main in shots:
-            if not _shoot(page, sec, name, imgdir, [embed, main]):
+            if report is not None and name in report["frames"]:
+                continue
+            # Direct YouTube embeds can reject an absent Referer (error 153).
+            urls = [main, embed] if platform == "youtube" else [embed, main]
+            if not _shoot(page, sec, name, imgdir, urls, platform, report):
                 print("  warning: capture failed for", name)
                 ok_all = False
+            if report is not None:
+                Path(imgdir).parent.joinpath("capture.json").write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return ok_all
     finally:
         ctx.close()
 
 
 def try_dedicated(shots, imgdir, profile_dir, video_id="", platform=""):
-    """Capture with the dedicated logged-in profile via Playwright (v2 pipeline)."""
+    """Retry incomplete headless captures in the dedicated visible Chrome."""
     if not os.path.isdir(profile_dir) or not os.listdir(profile_dir):
         return "unavailable: capture profile not initialized (run: python capture_frames.py --setup-profile)"
     try:
@@ -251,19 +372,30 @@ def try_dedicated(shots, imgdir, profile_dir, video_id="", platform=""):
     except ImportError:
         return "unavailable: Playwright not installed (python -m pip install playwright)"
     last_err = None
+    report = {"video_id": video_id, "platform": platform, "frames": {}, "attempts": [], "runs": []}
     for headless in (True, False):  # A 层：headless 优先，回退 headful
+        run = {"headless": headless, "complete": False}
+        report["runs"].append(run)
         try:
             with sync_playwright() as p:
-                _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless)
-            return None
+                complete = _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless, report=report)
+            run["complete"] = complete
+            if complete:
+                return None
+            last_err = f"headless={headless} finished with missing frames"
         except Exception as e:
             last_err = f"headless={headless} failed: {e}"
+            run["error"] = str(e).splitlines()[0][:400]
+        finally:
+            Path(imgdir).parent.joinpath("capture.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print("  " + last_err, flush=True)
     return last_err
 
 
 METHOD_ORDER = ["dedicated"]
 METHOD_DESC = {
-    "dedicated": "dedicated capture profile (v2: headless, forced top quality, native size, precise seek)",
+    "dedicated": "dedicated Chrome (highest available quality, native pixels, verified timestamp)",
 }
 
 
@@ -278,6 +410,8 @@ def main() -> None:
                     help="one-time: open Chrome with the dedicated profile to log in")
     ap.add_argument("--profile-dir", default=DEFAULT_PROFILE_DIR,
                     help="dedicated Chrome user-data-dir (default: <repo>/.capture-profile)")
+    ap.add_argument("--recapture", action="store_true",
+                    help="recapture all requested frames; preserve replaced images in _capture_backups/")
     args = ap.parse_args()
 
     if args.setup_profile:
@@ -314,7 +448,7 @@ def main() -> None:
         materialize(book, tagged, imgdir)
         return
 
-    missing = frames_missing(timestamps, imgdir)
+    missing = timestamps if args.recapture else frames_missing(timestamps, imgdir)
     if not missing:
         print("all frames present; nothing to capture")
         materialize(book, tagged, imgdir)

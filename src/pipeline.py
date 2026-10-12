@@ -16,12 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUTS = {
     "transcript": ("transcript.json",),
     "corrected": ("transcript.corrected.txt", "corrections.json"),
+    "translated": ("translation.json",),
     "book": ("book.tagged.md",),
     "images": ("book.md",),
     "html": ("book.html",),
 }
 RULES = {
     "corrected": ("prompts/correct_transcript.md",),
+    "translated": ("prompts/translate_transcript.md",),
     "book": ("prompts/stitcher_system.md",),
     "html": ("src/post_process.py",),
 }
@@ -30,6 +32,10 @@ RULES = {
 def fingerprint(directory, stage, upstream, root):
     paths = [directory / name for name in OUTPUTS[stage]]
     paths.extend(root / name for name in RULES.get(stage, ()))
+    if stage == "translated" and (directory / "translation.json").is_file():
+        record = read_json(directory / "translation.json")
+        if record.get("source_language", "").lower() != record.get("target_language", "").lower():
+            paths.append(directory / "transcript.translated.txt")
     if stage == "images" and (directory / "book.md").is_file():
         paths.extend(image_paths(directory, read_text(directory / "book.md")))
     digest = hashlib.sha256(upstream.encode("ascii"))
@@ -62,7 +68,7 @@ def status(directory, mode="book", root=ROOT):
         check = validate_stage(directory, stage)
         try:
             signature = fingerprint(directory, stage, upstream, root)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
             signature = "invalid"
             check["ok"] = False
             check["errors"].append(str(exc))

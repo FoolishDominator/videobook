@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import publish
-from site_index import build_index_html
+from site_index import build_course_pages, build_index_html
 
 
 class PublishTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class PublishTests(unittest.TestCase):
         self.commit(self.site)
         self.video = self.source / "output" / "test-video"
         self.write(self.video, "transcript.json", json.dumps({"title": "Course & notes"}))
-        self.write(self.video, "book.html", "<h1>Course notes</h1>\n")
+        self.write(self.video, "book.html", '<h1>Course notes</h1><img src="images/frame.png">\n')
         self.write(self.video, "book.md", "# Course notes\n")
         self.write(self.video, "transcript.corrected.txt", "Reviewed transcript\n")
         self.write(self.video, "images/frame.png", "image fixture")
@@ -57,9 +57,15 @@ class PublishTests(unittest.TestCase):
         self.git(repo, "add", "-A")
         self.git(repo, "commit", "-m", "Fixture")
 
-    def prepare(self):
+    def prepare(self, *extra_args):
         with patch.object(publish, "BASE", str(self.source)), patch.object(sys, "argv", [
-            "publish.py", "test-video", "--site-repo", str(self.site),
+            "publish.py", "test-video", "--site-repo", str(self.site), *extra_args,
+        ]), patch("builtins.print"):
+            publish.main()
+
+    def migrate(self):
+        with patch.object(publish, "BASE", str(self.source)), patch.object(sys, "argv", [
+            "publish.py", "--migrate-layout", "--site-repo", str(self.site),
         ]), patch("builtins.print"):
             publish.main()
 
@@ -73,12 +79,12 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.git(self.site, "show", f"{ref}:index.html"), "Personal homepage")
         self.assertEqual(self.git(self.site, "show", f"{ref}:lessons/older/book.html"), "Existing notes")
         files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
-        self.assertIn("lessons/Course & notes/book.html", files)
-        self.assertIn("lessons/Course & notes/transcript.corrected.txt", files)
-        self.assertNotIn("lessons/Course & notes/run.json", files)
+        self.assertIn("lessons/notes/test-video/book.html", files)
+        self.assertIn("lessons/notes/test-video/transcript.corrected.txt", files)
+        self.assertNotIn("lessons/notes/test-video/run.json", files)
         self.assertNotIn("draft.txt", files)
         page = self.git(self.site, "show", f"{ref}:lessons/index.html")
-        self.assertIn('href="Course%20%26%20notes/book.html"', page)
+        self.assertIn('href="/lessons/notes/test-video/book.html"', page)
         self.assertIn("Course &amp; notes", page)
 
     def test_repeat_after_merge_is_idempotent(self):
@@ -96,15 +102,109 @@ class PublishTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.git(self.site, "rev-parse", "codex/publish-lessons"), tip)
 
-    def test_title_changes_remove_only_the_previous_note_folder(self):
+    def test_title_changes_preserve_published_urls(self):
         self.prepare()
         self.git(self.site, "merge", "--ff-only", "codex/publish-lessons")
         self.write(self.video, "transcript.json", json.dumps({"title": "Renamed notes"}))
         self.prepare()
         files = self.git(self.site, "ls-tree", "-r", "--name-only", "codex/publish-lessons")
-        self.assertNotIn("Course & notes/", files)
-        self.assertIn("lessons/Renamed notes/book.html", files)
+        self.assertNotIn("Renamed notes/", files)
+        self.assertIn("lessons/notes/test-video/book.html", files)
         self.assertIn("lessons/older/book.html", files)
+        manifest = json.loads(self.git(self.site, "show", "codex/publish-lessons:lessons/manifest.json"))
+        self.assertEqual(manifest["test-video"]["title"], "Renamed notes")
+
+    def test_course_membership_survives_unchanged_and_updated_publications(self):
+        course = "MIT 15.401 Finance Theory"
+        self.prepare("--course", course)
+        ref = "codex/publish-lessons"
+        self.git(self.site, "merge", "--ff-only", ref)
+        original = self.git(self.site, "rev-parse", ref)
+        self.prepare()
+        self.assertEqual(self.git(self.site, "rev-parse", ref), original)
+
+        self.write(self.video, "book.html", "<h1>Updated course notes</h1>\n")
+        self.prepare()
+        manifest = json.loads(self.git(self.site, "show", f"{ref}:lessons/manifest.json"))
+        self.assertEqual(manifest["test-video"]["course"], course)
+        page = self.git(self.site, "show", f"{ref}:lessons/index.html")
+        self.assertIn('href="/lessons/courses/mit-15-401-finance-theory/"', page)
+        self.assertNotIn("Course &amp; notes", page)
+        self.assertIn("Older notes", page)
+        course_page = self.git(self.site, "show", f"{ref}:lessons/courses/mit-15-401-finance-theory/index.html")
+        self.assertIn('href="/lessons/courses/mit-15-401-finance-theory/test-video/book.html"', course_page)
+        self.assertIn('href="/lessons/courses/mit-15-401-finance-theory/test-video/book.md" download', course_page)
+        self.assertIn('href="/lessons/courses/mit-15-401-finance-theory/test-video/transcript.corrected.txt"', course_page)
+        self.assertEqual(self.git(self.site, "show", f"{ref}:lessons/older/book.html"), "Existing notes")
+
+    def test_moving_a_note_removes_the_old_directory_and_empty_course(self):
+        self.prepare("--course", "Original course")
+        ref = "codex/publish-lessons"
+        self.git(self.site, "merge", "--ff-only", ref)
+        self.prepare("--course", "New course")
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        self.assertFalse(any(name.startswith("lessons/courses/original-course/") for name in files))
+        self.assertIn("lessons/courses/new-course/index.html", files)
+        self.assertIn("lessons/courses/new-course/test-video/book.html", files)
+        note = "lessons/courses/new-course/test-video"
+        self.assertEqual(self.git(self.site, "show", f"{ref}:{note}/transcript.corrected.txt"), "Reviewed transcript")
+        self.assertEqual(self.git(self.site, "show", f"{ref}:{note}/images/frame.png"), "image fixture")
+        self.git(self.site, "merge", "--ff-only", ref)
+        self.write(self.video, "book.html", "<h1>Updated notes without the old illustration</h1>\n")
+        self.prepare()
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        self.assertFalse(any(name.startswith("lessons/courses/original-course/") for name in files))
+        self.assertNotIn("lessons/courses/new-course/test-video/images/frame.png", files)
+
+    def test_course_pages_sort_sessions_numerically_and_escape_titles(self):
+        course = "MIT 15.401 Finance Theory"
+        manifest = {str(number): {
+            "folder": f"Ses {number}", "title": f"Ses {number}: Notes & examples",
+            "course": course, "corrected": True,
+        } for number in (10, 2, 1)}
+        page = build_course_pages(manifest)["mit-15-401-finance-theory"]
+        self.assertLess(page.index("Ses 1:"), page.index("Ses 2:"))
+        self.assertLess(page.index("Ses 2:"), page.index("Ses 10:"))
+        self.assertIn("Notes &amp; examples", page)
+        self.assertIn('href="/lessons/Ses%201/book.html"', page)
+        self.assertIn("3 节课", build_index_html(manifest))
+
+    def test_moving_one_note_preserves_the_other_notes_in_its_previous_course(self):
+        self.prepare("--course", "Original course")
+        ref = "codex/publish-lessons"
+        self.git(self.site, "merge", "--ff-only", ref)
+        manifest = json.loads((self.site / "lessons/manifest.json").read_text(encoding="utf-8"))
+        manifest["other"] = {
+            "folder": "courses/original-course/other", "title": "Other course notes",
+            "course": "Original course", "course_slug": "original-course",
+        }
+        self.write(self.site, "lessons/manifest.json", json.dumps(manifest))
+        self.write(self.site, "lessons/courses/original-course/other/book.html", "Other notes")
+        self.commit(self.site)
+        self.prepare("--course", "New course")
+        original_course = self.git(self.site, "show", f"{ref}:lessons/courses/original-course/index.html")
+        self.assertIn("Other course notes", original_course)
+        self.assertNotIn("test-video/", original_course)
+        self.assertEqual(self.git(self.site, "show", f"{ref}:lessons/courses/original-course/other/book.html"), "Other notes")
+
+    def test_migration_rejects_a_destination_nested_inside_the_old_note(self):
+        self.write(self.site, "lessons/manifest.json", json.dumps({
+            "nested": {"folder": "courses/finance", "title": "Ses 1", "course": "Finance"},
+        }))
+        self.write(self.site, "lessons/courses/finance/book.html", "Published notes")
+        self.commit(self.site)
+        with self.assertRaises(ValueError):
+            self.migrate()
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+        self.assertEqual(self.git(self.site, "show", "HEAD:lessons/courses/finance/book.html"), "Published notes")
+
+    def test_conflicting_course_paths_are_rejected(self):
+        manifest = {
+            "first": {"folder": "first", "course": "Course A"},
+            "second": {"folder": "second", "course": "Course-A"},
+        }
+        with self.assertRaises(ValueError):
+            build_course_pages(manifest)
 
     def test_publication_paths_stay_inside_content_root(self):
         with self.assertRaises(ValueError):
@@ -117,8 +217,95 @@ class PublishTests(unittest.TestCase):
             "folder": "course #1", "title": '<script>alert("x")</script>',
         }})
         self.assertNotIn("<script>", page)
-        self.assertIn('href="course%20%231/book.html"', page)
+        self.assertIn('href="/lessons/course%20%231/book.html"', page)
         self.assertIn("&lt;script&gt;", page)
+
+    def test_migration_reuses_published_content_cleans_unused_files_and_is_idempotent(self):
+        manifest = json.loads((self.site / "lessons/manifest.json").read_text(encoding="utf-8"))
+        for number in (1, 2):
+            folder = f"Ses {number} Old title"
+            manifest[f"legacy-{number}"] = {
+                "folder": folder, "title": f"Ses {number}: Original title",
+                "course": "MIT 15.401 Finance Theory", "updated": "2026-01-01", "corrected": True,
+            }
+            note = self.site / "lessons" / folder
+            self.write(note, "book.html", '<html><head><title>Notes</title>\n</head>\n<body>\n'
+                       '<h1>Published notes</h1><img src="images/keep.png">'
+                       '<script src="assets/mermaid.min.js"></script></body></html>\n')
+            self.write(note, "book.md", "# Published notes\n![Keep](images/keep.png)\n")
+            self.write(note, "transcript.corrected.txt", "Published transcript")
+            self.write(note, "images/keep.png", "published image")
+            self.write(note, "images/unused.png", "obsolete image")
+            self.write(note, "assets/mermaid.min.js", "/* same Mermaid library */")
+            self.write(self.source / "output" / f"legacy-{number}", "book.html", "Unpublished changes")
+        self.write(self.site, "lessons/manifest.json", json.dumps(manifest))
+        self.commit(self.site)
+        original = self.git(self.site, "rev-parse", "HEAD")
+        self.migrate()
+        ref = "codex/publish-lessons"
+        self.assertEqual(self.git(self.site, "rev-parse", "HEAD"), original)
+        self.assertEqual(self.git(self.site, "status", "--porcelain"), "")
+        files = self.git(self.site, "ls-tree", "-r", "--name-only", ref).splitlines()
+        shared_assets = [name for name in files if name.startswith("assets/vendor/mermaid-")]
+        self.assertEqual(len(shared_assets), 1)
+        self.assertFalse(any(name.endswith("unused.png") or name.endswith("assets/mermaid.min.js") for name in files))
+        migrated = json.loads(self.git(self.site, "show", f"{ref}:lessons/manifest.json"))
+        for number in (1, 2):
+            meta = migrated[f"legacy-{number}"]
+            self.assertEqual(meta["folder"], f"courses/mit-15-401-finance-theory/ses-{number:02d}")
+            self.assertEqual(meta["course_slug"], "mit-15-401-finance-theory")
+            self.assertEqual(meta["updated"], "2026-01-01")
+            self.assertNotIn("aliases", meta)
+            self.assertTrue(meta["markdown"])
+            html = self.git(self.site, "show", f"{ref}:lessons/{meta['folder']}/book.html")
+            self.assertIn("Published notes", html)
+            self.assertNotIn("Unpublished changes", html)
+            self.assertEqual(html.count('rel="canonical"'), 1)
+            self.assertEqual(html.count('aria-label="课程导航"'), 1)
+            self.assertIn(f'src="/{shared_assets[0]}"', html)
+            self.assertFalse(any(name.startswith(f"lessons/Ses {number} Old title/") for name in files))
+        self.git(self.site, "merge", "--ff-only", ref)
+        first = self.git(self.site, "rev-parse", ref)
+        self.migrate()
+        self.assertEqual(self.git(self.site, "rev-parse", ref), first)
+
+    def test_course_publication_preserves_paths_on_title_edits_and_shares_assets(self):
+        self.git(self.site, "config", "core.autocrlf", "true")
+        self.write(self.video, "transcript.json", json.dumps({"title": "Ses 1: Initial title"}))
+        self.write(self.video, "book.html", '<html><head><title>Notes</title>\n</head><body>\n'
+                   '<article class="book-content"><script src="assets/mermaid.min.js"></script>'
+                   '<p>Notes</p></article></body></html>\n')
+        self.write(self.video, "assets/mermaid.min.js", "/* Mermaid */")
+        self.prepare("--course", "Finance")
+        ref = "codex/publish-lessons"
+        html = self.git(self.site, "show", f"{ref}:lessons/courses/finance/ses-01/book.html")
+        self.assertLess(html.index('<article class="book-content">'), html.index('aria-label="课程导航"'))
+        self.git(self.site, "merge", "--ff-only", ref)
+        original = self.git(self.site, "rev-parse", ref)
+        self.prepare()
+        self.assertEqual(self.git(self.site, "rev-parse", ref), original)
+        self.write(self.video, "transcript.json", json.dumps({"title": "Introduction, renamed"}))
+        self.prepare()
+        manifest = json.loads(self.git(self.site, "show", f"{ref}:lessons/manifest.json"))
+        self.assertEqual(manifest["test-video"]["folder"], "courses/finance/ses-01")
+        self.assertEqual(manifest["test-video"]["title"], "Introduction, renamed")
+        manifest["second"] = {"folder": "courses/finance/ses-02", "title": "Ses 2: Valuation", "course": "Finance"}
+        page = build_course_pages(manifest)["finance"]
+        self.assertLess(page.index("Introduction, renamed"), page.index("Ses 2: Valuation"))
+
+    def test_conflicting_or_nested_note_paths_abort_before_publication(self):
+        self.write(self.site, "lessons/manifest.json", json.dumps({
+            "older": {"folder": "older", "title": "Ses 1", "course": "Finance"},
+            "other": {"folder": "other", "title": "Ses 1", "course": "Finance"},
+        }))
+        self.commit(self.site)
+        with self.assertRaises(ValueError):
+            self.migrate()
+        self.assertIsNone(publish.branch_tip("codex/publish-lessons", str(self.site)))
+        self.assertEqual(self.git(self.site, "show", "HEAD:lessons/older/book.html"), "Existing notes")
+        for folder in ("/absolute", "../outside", "courses/../../outside", "C:/outside", "courses\\outside"):
+            with self.subTest(folder=folder), self.assertRaises(ValueError):
+                publish.content_path(self.site, folder)
 
 
 if __name__ == "__main__":
