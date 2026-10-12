@@ -12,10 +12,11 @@ dependencies = [
     "markdown>=3.5.0",
     "imageio-ffmpeg>=0.6.0",
     "playwright>=1.40.0",
+    "Send2Trash>=1.8.3",
 ]
 
 [project.optional-dependencies]
-asr = ["faster-whisper>=1.0.0"]
+asr = ["faster-whisper>=1.0.0", "av>=11,<19", "socksio>=1.0.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

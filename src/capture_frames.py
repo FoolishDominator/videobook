@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from extract_frames import materialize
+from browser_config import find_chrome_exe, browser_launch_options
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROFILE_DIR = os.path.join(BASE_DIR, ".capture-profile")
@@ -92,26 +93,6 @@ def frames_missing(timestamps, imgdir):
     return [ts for ts in timestamps
             if not os.path.exists(os.path.join(imgdir, "shot_" + ts.replace(":", "_") + ".png"))]
 
-
-def find_chrome_exe():
-    candidates = []
-    if sys.platform == "win32":
-        for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
-            base = os.environ.get(env)
-            if base:
-                candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
-    elif sys.platform == "darwin":
-        candidates.append("/Applications/Google Chrome.app/Contents/Google Chrome")
-    else:
-        import shutil
-        for name in ("google-chrome", "google-chrome-stable"):
-            exe = shutil.which(name)
-            if exe:
-                return exe
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return None
 
 
 def setup_profile(profile_dir: str, open_url: str = "https://www.bilibili.com") -> None:
@@ -332,7 +313,7 @@ def _shoot(page, sec, name, imgdir, urls, platform="", report=None):
 
 def _run_capture(p, shots, imgdir, profile_dir, video_id, platform, headless, report=None):
     ctx = p.chromium.launch_persistent_context(
-        profile_dir, channel="chrome", headless=headless,
+        profile_dir, **browser_launch_options(), headless=headless,
         viewport={"width": 1280, "height": 720},
         device_scale_factor=1,
         args=["--autoplay-policy=no-user-gesture-required"])

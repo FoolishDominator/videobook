@@ -46,7 +46,7 @@ class BrowserCaptureTests(unittest.TestCase):
         cls.html = ('<style>body{margin:0}video{width:640px;height:480px}</style>'
                     '<video muted autoplay loop src="data:video/webm;base64,' + data + '"></video>')
         cls.playwright = sync_playwright().start()
-        cls.browser = cls.playwright.chromium.launch(channel='chrome', headless=True,
+        cls.browser = cls.playwright.chromium.launch(**capture_frames.browser_launch_options(), headless=True,
                            ignore_default_args=['--hide-scrollbars'],
                            args=['--autoplay-policy=no-user-gesture-required'])
 

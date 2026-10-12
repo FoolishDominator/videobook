@@ -1,20 +1,24 @@
 """Prepare public note files and share static-site assets."""
 
 from hashlib import sha256
-from html import escape
+from html import escape, unescape
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 import shutil
-from urllib.parse import quote, unquote
+from urllib.parse import unquote, urlsplit
 
-from site_index import SITE_URL, note_url
+from markdown import markdown
+
+from site_index import DEFAULT_SITE
 
 
 def content_path(root, folder):
     """Resolve a nonempty relative path strictly inside the publication root."""
     root = Path(root).resolve()
     parts = folder.split("/")
-    if any(part in ("", ".", "..") or "\\" in part or ":" in part for part in parts):
+    if any(part in ("", ".", "..") or part.casefold() == ".git" or
+           "\\" in part or ":" in part for part in parts):
         raise ValueError(f"无效的发布目录: {folder}")
     path = (root / folder).resolve()
     if path == root or root not in path.parents:
@@ -50,7 +54,50 @@ def read_files(directory):
             for p in directory.rglob("*") if p.is_file()}
 
 
-def prepare_note(source, meta, site_root, *, published=False):
+def _transcript_attachment(name):
+    """Conservatively exclude text/subtitle downloads and named transcripts.
+
+    This cannot classify prose inside book.html/book.md, or an arbitrarily
+    renamed attachment. Those still require human publication review.
+    """
+    path = Path(name.lower())
+    return (path.suffix in (".txt", ".srt", ".vtt", ".sbv", ".ttml", ".ass", ".ssa") or
+            re.search(r"transcript|subtitle|caption|translation|corrections", path.name) is not None)
+
+
+class _Links(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.values = []
+
+    def handle_starttag(self, tag, attrs):
+        self.values.extend(value for key, value in attrs
+                           if key.lower() in ("href", "src", "data", "poster", "action") and value)
+        for key, value in attrs:
+            if key.lower() == "srcset" and value:
+                self.values.extend(candidate.strip().split()[0] for candidate in value.split(",")
+                                   if candidate.strip())
+
+
+def _check_transcript_links(files):
+    """Fail closed instead of publishing links to excluded transcript files."""
+    for name, data in files.items():
+        if Path(name).suffix.lower() not in (".html", ".md"):
+            continue
+        text = data.decode("utf-8")
+        if name.lower().endswith(".md"):
+            text = markdown(text)
+        parser = _Links()
+        parser.feed(text)
+        for reference in parser.values:
+            reference = unquote(unescape(reference))
+            path = urlsplit(reference).path
+            if _transcript_attachment(path):
+                raise ValueError(f"--exclude-transcripts: {name} 仍引用字幕/文本附件 {reference}；请先移除链接并复核摘要")
+
+
+def prepare_note(source, meta, site_root, *, published=False, site=DEFAULT_SITE,
+                 exclude_transcripts=False):
     """Keep public payloads, trim unused images, and share identical Mermaid bundles."""
     source = Path(source)
     if published:
@@ -63,6 +110,10 @@ def prepare_note(source, meta, site_root, *, published=False):
             files.update({f"{folder}/{name}": data for name, data in read_files(source / folder).items()})
     if "book.html" not in files:
         raise ValueError(f"已发布笔记缺少 book.html: {source}")
+    if exclude_transcripts:
+        files = {name: data for name, data in files.items()
+                 if name in ("book.html", "book.md") or not _transcript_attachment(name)}
+        _check_transcript_links(files)
     html = files["book.html"].decode("utf-8")
     references = unquote(html + "\n" + files.get("book.md", b"").decode("utf-8"))
     for name in list(files):
@@ -79,19 +130,31 @@ def prepare_note(source, meta, site_root, *, published=False):
         shared.parent.mkdir(parents=True, exist_ok=True)
         shared.write_bytes(data)
         html = re.sub(r'''(src=["'])assets/mermaid\.min\.js(["'])''',
-                      lambda match: match[1] + f"/assets/vendor/{filename}" + match[2], html)
+                      lambda match: match[1] + site.site_href(f"assets/vendor/{filename}") + match[2], html)
+
+    # A migrated note may already use a publisher-owned shared bundle. Rebase
+    # those URLs for the explicitly configured project Pages prefix only when
+    # the matching asset exists in this repository.
+    def rebase_shared(match):
+        filename = match[2]
+        if not (Path(site_root) / "assets" / "vendor" / filename).is_file():
+            raise ValueError(f"共享 Mermaid 文件不存在: {filename}")
+        return match[1] + site.site_href(f"assets/vendor/{filename}") + match[3]
+
+    html = re.sub(r'''(src=["'])/[^"']*assets/vendor/(mermaid-[0-9a-f]{16}\.min\.js)(["'])''',
+                  rebase_shared, html)
 
     # Remove only markup owned by the publisher before regenerating it.
     html = re.sub(r'\n?<!-- publication-navigation -->.*?<!-- /publication-navigation -->\n?',
                   "\n", html, flags=re.S)
     html = re.sub(r'''\s*<link\b(?=[^>]*\brel=["']canonical["'])[^>]*>''', "", html, flags=re.I)
-    canonical = escape(SITE_URL + note_url(meta["folder"]), quote=True)
-    html = re.sub(r"</head>", f'    <link rel="canonical" href="{canonical}">\n</head>', html, count=1, flags=re.I)
+    canonical = escape(site.canonical(meta["folder"] + "/book.html"), quote=True)
+    html = re.sub(r"\s*</head>", f'\n    <link rel="canonical" href="{canonical}">\n</head>', html, count=1, flags=re.I)
     if meta.get("course"):
-        course_href = f'/lessons/courses/{quote(meta["course_slug"], safe="")}/'
+        course_href = site.content_href(f'courses/{meta["course_slug"]}/')
         navigation = ('\n<!-- publication-navigation -->\n'
                       '<nav aria-label="课程导航" style="margin:0 0 1.5rem;font-size:14px">'
-                      '<a href="/lessons/">Lessons</a> · '
+                      f'<a href="{site.content_href()}">Lessons</a> · '
                       f'<a href="{course_href}">{escape(meta["course"])}</a></nav>\n'
                       '<!-- /publication-navigation -->\n')
         article = r'''(<article\b[^>]*\bclass=["'][^"']*\bbook-content\b[^"']*["'][^>]*>)\s*'''
